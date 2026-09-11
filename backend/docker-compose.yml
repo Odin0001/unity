@@ -1,0 +1,101 @@
+# Full local stack for the multi-tenant ERP platform: Postgres, Redis, and
+# the app itself (frontend + backend bundled into one image by
+# ../Dockerfile — see the `app` service below for why its build context
+# is the monorepo root, not this directory).
+#
+# Usage:
+#   cp .env.example .env   # adjust credentials as needed
+#   docker compose up -d --build
+#
+# Postgres bootstraps two databases on first run (empty volume only):
+#   - erp_master_db           control-plane / tenant registry
+#   - erp_tenant_template_db  schema template cloned per new tenant
+#
+# Redis backs opaque access-token storage, session metadata, and rate
+# limiting, with AOF persistence so local sessions survive a restart.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: erp_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-erp_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-erp_dev_password}
+      # POSTGRES_DB is created automatically by the base image's
+      # entrypoint before init scripts run; init-dbs.sh adds the second one.
+      POSTGRES_DB: ${MASTER_DB:-erp_master_db}
+      MASTER_DB: ${MASTER_DB:-erp_master_db}
+      TENANT_TEMPLATE_DB: ${TENANT_TEMPLATE_DB:-erp_tenant_template_db}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-dbs.sh:/docker-entrypoint-initdb.d/init-dbs.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-erp_admin} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - erp_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: erp_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --requirepass ${REDIS_PASSWORD:-erp_dev_password}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-erp_dev_password} --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - erp_network
+
+  app:
+    build:
+      # Compose resolves relative paths against this file's own directory
+      # (backend/), so `..` is the monorepo root — the build needs both
+      # backend/ and the sibling frontend/ workspace, mirroring the
+      # `docker build -f backend/Dockerfile .` invocation run from root.
+      context: ..
+      dockerfile: backend/Dockerfile
+    image: tenants:local
+    container_name: tenants_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-erp_admin}:${POSTGRES_PASSWORD:-erp_dev_password}@postgres:5432/${MASTER_DB:-erp_master_db}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-erp_dev_password}@redis:6379
+      BIND_ADDR: 0.0.0.0:8080
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    networks:
+      - erp_network
+
+networks:
+  erp_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    name: erp_postgres_data
+  redis_data:
+    name: erp_redis_data
