@@ -15,15 +15,44 @@ components/hooks (frontend) pattern already established in `platform/`.
 
 ## Run everything (recommended)
 
-Requires Docker.
+Requires Podman and [podman-compose](https://github.com/containers/podman-compose)
+(`sudo apt install podman-compose`).
+
+### One-time setup
+
+If Docker's `docker-compose` is also installed, `podman compose` picks it
+over `podman-compose` and fails with *"Cannot connect to the Docker
+daemon"*. Pin the provider once per machine:
+
+```bash
+mkdir -p ~/.config/containers
+printf '[engine]\ncompose_providers = ["podman-compose"]\n' >> ~/.config/containers/containers.conf
+podman compose version   # should report podman-compose
+```
+
+(Or skip this and always call `podman-compose` directly. To hide the
+">>>> Executing external compose provider" banner, add
+`export PODMAN_COMPOSE_WARNING_LOGS=false` to your shell profile.)
+
+### Start
 
 ```bash
 cd backend
 cp .env.example .env   # adjust credentials if you want; defaults work locally
-docker compose up -d --build
+podman compose up -d --build
 ```
 
-This starts three containers on one Docker network:
+The first build takes several minutes (base image pulls + a full Rust
+release compile); later builds reuse the cargo-chef dependency layer.
+
+Check it's running:
+
+```bash
+podman compose ps            # postgres/redis should be healthy before app starts
+podman compose logs -f app
+```
+
+This starts three containers on one Podman network:
 
 | service    | what                                              | port  |
 | ---------- | ------------------------------------------------- | ----- |
@@ -34,23 +63,23 @@ This starts three containers on one Docker network:
 The `app` image is built from the monorepo root (it needs both
 `backend/` and `frontend/`) even though the compose file lives in
 `backend/` — see the comment on the `app` service in
-`backend/docker-compose.yml` if you're touching that build config.
+`backend/compose.yaml` if you're touching that build config.
 
 Once it's up: **http://localhost:8080** serves the SPA, and the API lives
 under `http://localhost:8080/api/v1`.
 
-Tear down with `docker compose down` (add `-v` to also drop the Postgres
+Tear down with `podman compose down` (add `-v` to also drop the Postgres
 and Redis volumes, e.g. after a migration reset).
 
 ## Run for local development (hot reload)
 
-Keep Postgres/Redis in Docker, run backend and frontend natively so you
+Keep Postgres/Redis in Podman, run backend and frontend natively so you
 get incremental compiles and Vite's dev server instead of a full image
 rebuild per change.
 
 ```bash
 # 1. Data services only
-cd backend && docker compose up -d postgres redis
+cd backend && podman compose up -d postgres redis
 
 # 2. Backend (new terminal)
 cd backend && cargo run
@@ -76,16 +105,15 @@ Redis) and a session-introspection endpoint are added on the backend.
 
 ```bash
 # from the monorepo root
-docker build -f backend/Dockerfile -t tenants:local .
-docker run --rm -p 8080:8080 \
-  --add-host=host.docker.internal:host-gateway \
-  -e DATABASE_URL=postgres://erp_admin:erp_dev_password@host.docker.internal:5432/erp_master_db \
-  -e REDIS_URL=redis://:erp_dev_password@host.docker.internal:6379 \
+podman build -f backend/Containerfile -t tenants:local .
+podman run --rm -p 8080:8080 \
+  -e DATABASE_URL=postgres://erp_admin:erp_dev_password@host.containers.internal:5432/erp_master_db \
+  -e REDIS_URL=redis://:erp_dev_password@host.containers.internal:6379 \
   tenants:local
 ```
 
-(`--add-host` is what makes `host.docker.internal` resolve on native Linux
-Docker, not just Docker Desktop — needed here since Postgres/Redis are
-running as separate containers, not inside this one.)
+(Podman resolves `host.containers.internal` to the host automatically —
+needed here since Postgres/Redis are running as separate containers, not
+inside this one.)
 
 Runs as non-root (`uid=10001`), Debian bookworm-slim base.

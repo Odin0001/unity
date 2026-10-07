@@ -1,11 +1,11 @@
 # Full local stack for the multi-tenant ERP platform: Postgres, Redis, and
 # the app itself (frontend + backend bundled into one image by
-# ../Dockerfile — see the `app` service below for why its build context
+# ./Containerfile — see the `app` service below for why its build context
 # is the monorepo root, not this directory).
 #
-# Usage:
+# Usage (requires podman-compose):
 #   cp .env.example .env   # adjust credentials as needed
-#   docker compose up -d --build
+#   podman-compose up -d --build
 #
 # Postgres bootstraps two databases on first run (empty volume only):
 #   - erp_master_db           control-plane / tenant registry
@@ -16,7 +16,7 @@
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: docker.io/library/postgres:16-alpine
     container_name: erp_postgres
     restart: unless-stopped
     environment:
@@ -32,7 +32,9 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init-dbs.sh:/docker-entrypoint-initdb.d/init-dbs.sh:ro
+      # `z` relabels the bind mount on SELinux hosts (Fedora/RHEL) so the
+      # container can read it; it's a no-op elsewhere.
+      - ./scripts/init-dbs.sh:/docker-entrypoint-initdb.d/init-dbs.sh:ro,z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-erp_admin} -d postgres"]
       interval: 10s
@@ -43,7 +45,7 @@ services:
       - erp_network
 
   redis:
-    image: redis:7-alpine
+    image: docker.io/library/redis:7-alpine
     container_name: erp_redis
     restart: unless-stopped
     command: >
@@ -69,9 +71,9 @@ services:
       # Compose resolves relative paths against this file's own directory
       # (backend/), so `..` is the monorepo root — the build needs both
       # backend/ and the sibling frontend/ workspace, mirroring the
-      # `docker build -f backend/Dockerfile .` invocation run from root.
+      # `podman build -f backend/Containerfile .` invocation run from root.
       context: ..
-      dockerfile: backend/Dockerfile
+      dockerfile: backend/Containerfile
     image: tenants:local
     container_name: tenants_app
     restart: unless-stopped

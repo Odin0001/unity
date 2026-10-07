@@ -1,15 +1,15 @@
-# syntax=docker/dockerfile:1.7
-#
 # Build context is the MONOREPO ROOT, not this backend/ directory, since
-# this now bundles the sibling frontend/ workspace. Build from the repo
-# root with:
-#   docker build -f backend/Dockerfile -t tenants:local .
-# (docker-compose.yml only orchestrates Postgres/Redis and is unaffected.)
+# this bundles the sibling frontend/ workspace. Build from the repo root
+# with:
+#   podman build -f backend/Containerfile -t tenants:local .
+#
+# Base images are fully qualified (docker.io/...) because Podman doesn't
+# silently resolve short names like `node:20` to Docker Hub.
 
 ########################################################################
 # Stage 1/4 — Frontend: compile the React/Vite/Tailwind SPA into dist/
 ########################################################################
-FROM node:20-bookworm-slim AS frontend
+FROM docker.io/library/node:20-bookworm-slim AS frontend
 WORKDIR /app/frontend
 
 COPY frontend/package.json frontend/package-lock.json ./
@@ -22,7 +22,7 @@ RUN npm run build
 # Stage 2/4 — Cargo Chef planner: compute the dependency recipe used to
 # cache the `cargo build` dependency layer independently of app source
 ########################################################################
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+FROM docker.io/lukemathwalker/cargo-chef:latest-rust-1 AS chef
 WORKDIR /app
 
 FROM chef AS planner
@@ -49,7 +49,7 @@ COPY --from=frontend /app/frontend/dist ./web/dist
 ########################################################################
 # Stage 4/4 — Runtime: minimal, non-root Debian Bookworm slim image
 ########################################################################
-FROM debian:bookworm-slim AS runtime
+FROM docker.io/library/debian:bookworm-slim AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
