@@ -1,81 +1,62 @@
-# Full local stack for the multi-tenant ERP platform: Postgres, Redis, and
-# the app itself (frontend + backend bundled into one image by
-# ./Containerfile — see the `app` service below for why its build context
-# is the monorepo root, not this directory).
+# Full local stack: Postgres, Redis, and the app itself (frontend + backend
+# bundled into one image by the repo-root Containerfile).
 #
 # Usage (requires podman-compose):
 #   cp .env.example .env   # adjust credentials as needed
 #   podman-compose up -d --build
 #
-# Postgres bootstraps two databases on first run (empty volume only):
-#   - erp_master_db           control-plane / tenant registry
-#   - erp_tenant_template_db  schema template cloned per new tenant
-#
-# Redis backs opaque access-token storage, session metadata, and rate
-# limiting, with AOF persistence so local sessions survive a restart.
+# Redis backs access-token storage, session metadata, and rate limiting,
+# with AOF persistence so local sessions survive a restart.
 
 services:
   postgres:
-    image: docker.io/library/postgres:16-alpine
-    container_name: erp_postgres
+    image: quay.io/sclorg/postgresql-16-c10s:latest
+    container_name: debt_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-erp_admin}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-erp_dev_password}
-      # POSTGRES_DB is created automatically by the base image's
-      # entrypoint before init scripts run; init-dbs.sh adds the second one.
-      POSTGRES_DB: ${MASTER_DB:-erp_master_db}
-      MASTER_DB: ${MASTER_DB:-erp_master_db}
-      TENANT_TEMPLATE_DB: ${TENANT_TEMPLATE_DB:-erp_tenant_template_db}
-      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRESQL_USER: ${POSTGRES_USER:-debt_admin}
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:-debt_dev_password}
+      POSTGRESQL_DATABASE: ${POSTGRES_DB:-debt_collection}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      # `z` relabels the bind mount on SELinux hosts (Fedora/RHEL) so the
-      # container can read it; it's a no-op elsewhere.
-      - ./scripts/init-dbs.sh:/docker-entrypoint-initdb.d/init-dbs.sh:ro,z
+      - postgres_data:/var/lib/pgsql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-erp_admin} -d postgres"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-debt_admin} -d ${POSTGRES_DB:-debt_collection}"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     networks:
-      - erp_network
+      - debt_network
 
   redis:
-    image: docker.io/library/redis:7-alpine
-    container_name: erp_redis
+    image: quay.io/sclorg/redis-7-c9s:latest
+    container_name: debt_redis
     restart: unless-stopped
-    command: >
-      redis-server
-      --appendonly yes
-      --appendfsync everysec
-      --requirepass ${REDIS_PASSWORD:-erp_dev_password}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-debt_dev_password}
+    command: ["run-redis", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
-      - redis_data:/data
+      - redis_data:/var/lib/redis/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-erp_dev_password} --no-auth-warning ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-debt_dev_password} --no-auth-warning ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 5s
     networks:
-      - erp_network
+      - debt_network
 
   app:
     build:
-      # Compose resolves relative paths against this file's own directory
-      # (backend/), so `..` is the monorepo root — the build needs both
-      # backend/ and the sibling frontend/ workspace, mirroring the
-      # `podman build -f backend/Containerfile .` invocation run from root.
+      # Relative to this file, so `..` is the repo root, where the
+      # Containerfile lives (podman-compose picks it up by name).
       context: ..
-      dockerfile: backend/Containerfile
     image: tenants:local
-    container_name: tenants_app
+    container_name: debt_app
     restart: unless-stopped
     depends_on:
       postgres:
@@ -83,21 +64,28 @@ services:
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-erp_admin}:${POSTGRES_PASSWORD:-erp_dev_password}@postgres:5432/${MASTER_DB:-erp_master_db}
-      REDIS_URL: redis://:${REDIS_PASSWORD:-erp_dev_password}@redis:6379
+      DATABASE_URL: postgres://${POSTGRES_USER:-debt_admin}:${POSTGRES_PASSWORD:-debt_dev_password}@postgres:5432/${POSTGRES_DB:-debt_collection}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-debt_dev_password}@redis:6379
       BIND_ADDR: 0.0.0.0:8080
+      # The admin stack runs as a separate compose project, so reach it
+      # through the host.
+      ADMIN_API_URL: ${ADMIN_API_URL_CONTAINER:-http://host.containers.internal:8081}
+      TENANT_API_KEY: ${TENANT_API_KEY:-}
+      EXECUTIVE_MANAGER_EMAIL: ${EXECUTIVE_MANAGER_EMAIL:-}
+      EXECUTIVE_MANAGER_PASSWORD: ${EXECUTIVE_MANAGER_PASSWORD:-}
+      EXECUTIVE_MANAGER_NAME: ${EXECUTIVE_MANAGER_NAME:-}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "${APP_PORT:-8080}:8080"
     networks:
-      - erp_network
+      - debt_network
 
 networks:
-  erp_network:
+  debt_network:
     driver: bridge
 
 volumes:
   postgres_data:
-    name: erp_postgres_data
+    name: debt_postgres_data
   redis_data:
-    name: erp_redis_data
+    name: debt_redis_data

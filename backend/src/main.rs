@@ -1,32 +1,24 @@
-// `modules/` is intentionally empty right now (see src/modules/mod.rs), so
-// every item in `platform` and `shared_kernel` below — including their
-// public re-exports — is unused until the first feature module consumes
-// it. Remove this once that module lands; it's silencing real signal, not
-// a permanent policy.
-#![allow(dead_code, unused_imports)]
+use std::time::Duration;
 
-mod modules;
-mod platform;
-mod shared_kernel;
-
-use axum::Router;
-use redis::aio::ConnectionManager;
-use tower_http::{
-    services::{ServeDir, ServeFile},
-    trace::TraceLayer,
+use tenants::{
+    modules::{
+        employees::application as employees,
+        tenancy::{application::check_admin_link, AdminClient, AdminClientError},
+    },
+    platform::{db, error::AppError, AppState},
 };
-
-use platform::{
-    db::{self, DbConfig},
-    AppState,
-};
+use tokio::signal::unix::{signal, SignalKind};
 
 #[derive(Debug, thiserror::Error)]
 enum StartupError {
+    #[error("can't read .env: {0}")]
+    Env(#[source] dotenvy::Error),
     #[error(transparent)]
     Db(#[from] db::DbError),
-    #[error("failed to connect to redis: {0}")]
-    Redis(#[from] redis::RedisError),
+    #[error(transparent)]
+    AdminClient(#[from] AdminClientError),
+    #[error("failed to create executive manager: {0}")]
+    ExecutiveManager(#[source] AppError),
     #[error("failed to bind {addr}: {source}")]
     Bind {
         addr: String,
@@ -46,55 +38,53 @@ async fn main() {
 }
 
 async fn run() -> Result<(), StartupError> {
-    // Missing .env is fine in production, where config comes from the
-    // environment directly (e.g. injected by the orchestrator).
-    let _ = dotenvy::dotenv();
+    // No .env in production; config comes straight from the environment.
+    // A .env that exists but doesn't parse is a mistake worth stopping for.
+    if let Err(err) = dotenvy::dotenv() {
+        if !err.not_found() {
+            return Err(StartupError::Env(err));
+        }
+    }
     init_tracing();
 
-    let db_config = DbConfig::from_env();
-    let pool = db::init_pool(&db_config).await?;
-    db::run_migrations(&pool).await?;
+    let pool = db::connect().await?;
+    db::migrate(&pool).await?;
+    employees::ensure_executive_manager(&pool)
+        .await
+        .map_err(StartupError::ExecutiveManager)?;
 
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://:erp_dev_password@127.0.0.1:6379".to_string());
-    let redis_client = redis::Client::open(redis_url)?;
-    let redis = ConnectionManager::new(redis_client).await?;
+    let admin = AdminClient::from_env()?;
+    check_admin_link(&admin).await;
 
-    let state = AppState { db: pool, redis };
-
-    // Serves the compiled SPA from web/dist; any path that doesn't match a
-    // real file falls back to index.html so client-side routing works.
-    //
-    // Deliberately `.fallback()`, not `.not_found_service()`: the latter
-    // forces the response status to 404 (see tower_http::services::fs::
-    // ServeDir::not_found_service docs) even though index.html is served
-    // successfully — which reads as a broken page to health checks and to
-    // client-side routers expecting a normal 200 navigation. `.fallback()`
-    // serves the same content and preserves whatever status the fallback
-    // service actually returns (200 for a served file).
-    let static_assets = ServeDir::new("web/dist").fallback(ServeFile::new("web/dist/index.html"));
-
-    // `modules/` is empty for now — nest each feature module's router here
-    // as it's added, e.g. `.nest("/api/inventory", modules::inventory::
-    // infrastructure::http::router())`.
-    let app: Router = Router::new()
-        .fallback_service(static_assets)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let state = AppState { db: pool, admin };
+    tokio::spawn(purge_sessions(state.clone()));
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
-        .map_err(|source| StartupError::Bind { addr: bind_addr.clone(), source })?;
+        .map_err(|source| StartupError::Bind {
+            addr: bind_addr.clone(),
+            source,
+        })?;
 
     tracing::info!(%bind_addr, "tenants service listening");
 
-    axum::serve(listener, app)
+    axum::serve(listener, tenants::app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .map_err(StartupError::Serve)?;
+        .map_err(StartupError::Serve)
+}
 
-    Ok(())
+async fn purge_sessions(state: AppState) {
+    let mut tick = tokio::time::interval(Duration::from_secs(15 * 60));
+    loop {
+        tick.tick().await;
+        match employees::purge_expired_sessions(&state.db).await {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(removed, "purged expired sessions"),
+            Err(err) => tracing::warn!(%err, "failed to purge expired sessions"),
+        }
+    }
 }
 
 fn init_tracing() {
@@ -107,27 +97,22 @@ fn init_tracing() {
 }
 
 async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+    let sigterm = async {
+        match signal(SignalKind::terminate()) {
             Ok(mut sig) => {
                 sig.recv().await;
             }
-            Err(err) => tracing::error!(%err, "failed to install SIGTERM handler"),
+            Err(err) => {
+                tracing::error!(%err, "can't listen for SIGTERM, only ctrl-c will stop the server");
+                std::future::pending::<()>().await;
+            }
         }
     };
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm => {}
     }
 
-    tracing::info!("shutdown signal received, draining in-flight requests");
+    tracing::info!("shutting down, draining in-flight requests");
 }
