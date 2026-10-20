@@ -4,13 +4,25 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
-    domain::{
-        effective_permissions, normalize_email, Action, Actor, Employee, Permission, Resource,
-        MIN_PASSWORD_LEN,
-    },
+    domain::{normalize_email, Employee, MIN_PASSWORD_LEN},
     infrastructure::postgres,
 };
-use crate::platform::{error::AppError, password, token};
+use crate::platform::{
+    error::AppError,
+    password,
+    permissions::{self, Access, Action, Permission, Resource},
+    token,
+};
+
+/// An employee together with what they're allowed to do. For a request,
+/// this is the signed-in employee acting.
+#[derive(Debug, Serialize)]
+pub struct Actor {
+    #[serde(flatten)]
+    pub employee: Employee,
+    #[serde(rename = "permissions")]
+    pub access: Access,
+}
 
 #[derive(Debug, Serialize)]
 pub struct Session {
@@ -40,7 +52,7 @@ pub async fn login(
     Ok(Session {
         token,
         expires_at,
-        employee: with_permissions(db, employee).await?,
+        employee: with_access(db, employee).await?,
     })
 }
 
@@ -50,7 +62,7 @@ pub async fn authenticate(db: &PgPool, token: &str) -> Result<Actor, AppError> {
     let employee = postgres::touch_session(db, &token::hash(token))
         .await?
         .ok_or(AppError::Unauthorized)?;
-    with_permissions(db, employee).await
+    with_access(db, employee).await
 }
 
 pub async fn logout(db: &PgPool, token: &str) -> Result<(), AppError> {
@@ -105,14 +117,14 @@ pub async fn create_executive_manager(
 }
 
 pub async fn list(db: &PgPool, actor: &Actor) -> Result<Vec<Employee>, AppError> {
-    actor.require(Resource::Employees, Action::Read)?;
+    actor.access.require(Resource::Employees, Action::Read)?;
     Ok(postgres::list(db).await?)
 }
 
 pub async fn get(db: &PgPool, actor: &Actor, id: Uuid) -> Result<Actor, AppError> {
-    actor.require(Resource::Employees, Action::Read)?;
+    actor.access.require(Resource::Employees, Action::Read)?;
     let employee = postgres::find(db, id).await?.ok_or(AppError::NotFound)?;
-    with_permissions(db, employee).await
+    with_access(db, employee).await
 }
 
 /// New employees start with no permissions; the executive manager grants
@@ -124,7 +136,7 @@ pub async fn create(
     full_name: &str,
     password: String,
 ) -> Result<Employee, AppError> {
-    actor.require(Resource::Employees, Action::Create)?;
+    actor.access.require(Resource::Employees, Action::Create)?;
     let (email, full_name) = validate_new_employee(email, full_name, &password)?;
     let password_hash = password::hash(password).await?;
 
@@ -145,12 +157,12 @@ pub async fn update(
     full_name: Option<&str>,
     is_active: Option<bool>,
 ) -> Result<Employee, AppError> {
-    actor.require(Resource::Employees, Action::Update)?;
+    actor.access.require(Resource::Employees, Action::Update)?;
     let target = postgres::find(db, id).await?.ok_or(AppError::NotFound)?;
 
     if target.is_executive {
         // Only the executive edits their own record, and they stay active.
-        actor.require_executive()?;
+        actor.access.require_executive()?;
         if is_active == Some(false) {
             return Err(AppError::Invalid(
                 "the executive manager can't be deactivated",
@@ -169,7 +181,7 @@ pub async fn update(
 }
 
 pub async fn delete(db: &PgPool, actor: &Actor, id: Uuid) -> Result<(), AppError> {
-    actor.require(Resource::Employees, Action::Delete)?;
+    actor.access.require(Resource::Employees, Action::Delete)?;
     let target = postgres::find(db, id).await?.ok_or(AppError::NotFound)?;
     if target.is_executive {
         return Err(AppError::Forbidden);
@@ -181,14 +193,14 @@ pub async fn delete(db: &PgPool, actor: &Actor, id: Uuid) -> Result<(), AppError
 }
 
 /// Replaces an employee's permissions. Only the executive manager decides
-/// who can do what.
+/// who can do what, and their own access can't be edited.
 pub async fn set_permissions(
     db: &PgPool,
     actor: &Actor,
     id: Uuid,
-    permissions: Vec<Permission>,
+    permissions: &[Permission],
 ) -> Result<Vec<Permission>, AppError> {
-    actor.require_executive()?;
+    actor.access.require_executive()?;
     let target = postgres::find(db, id).await?.ok_or(AppError::NotFound)?;
     if target.is_executive {
         return Err(AppError::Invalid(
@@ -196,28 +208,12 @@ pub async fn set_permissions(
         ));
     }
 
-    let mut seen = Vec::with_capacity(permissions.len());
-    for p in &permissions {
-        if seen.contains(&p.resource) {
-            return Err(AppError::Invalid("each resource can only appear once"));
-        }
-        seen.push(p.resource);
-    }
-
-    postgres::replace_permissions(db, id, &permissions).await?;
-    Ok(postgres::permissions_of(db, id).await?)
+    permissions::replace(db, id, permissions).await
 }
 
-async fn with_permissions(db: &PgPool, employee: Employee) -> Result<Actor, AppError> {
-    let stored = if employee.is_executive {
-        Vec::new()
-    } else {
-        postgres::permissions_of(db, employee.id).await?
-    };
-    Ok(Actor {
-        permissions: effective_permissions(&employee, stored),
-        employee,
-    })
+async fn with_access(db: &PgPool, employee: Employee) -> Result<Actor, AppError> {
+    let access = permissions::load(db, employee.id, employee.is_executive).await?;
+    Ok(Actor { employee, access })
 }
 
 fn validate_new_employee<'a>(

@@ -9,10 +9,10 @@ use uuid::Uuid;
 
 use crate::{
     modules::employees::{
-        application::{self, Session},
-        domain::{Actor, Employee, Permission},
+        application::{self, Actor, Session},
+        domain::Employee,
     },
-    platform::{error::AppError, AppState},
+    platform::{error::AppError, permissions::Permission, AppState},
 };
 
 pub fn auth_router() -> Router<AppState> {
@@ -144,7 +144,7 @@ async fn set_permissions(
     Json(permissions): Json<Vec<Permission>>,
 ) -> Result<Json<Vec<Permission>>, AppError> {
     Ok(Json(
-        application::set_permissions(&state.db, &actor, id, permissions).await?,
+        application::set_permissions(&state.db, &actor, id, &permissions).await?,
     ))
 }
 

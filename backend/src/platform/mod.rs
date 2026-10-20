@@ -1,6 +1,7 @@
 pub mod db;
 pub mod error;
 pub mod password;
+pub mod permissions;
 pub mod token;
 
 use sqlx::PgPool;

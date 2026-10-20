@@ -1,6 +1,5 @@
-//! Employees of this tenant, their per-resource permissions, and sign-in.
-//! The first employee is the executive manager and can do everything,
-//! including deciding what everyone else can do.
+//! Employees of this tenant and their sign-in. The first employee is the
+//! executive manager. Access checks go through `platform::permissions`.
 
 pub mod application;
 pub mod domain;

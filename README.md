@@ -18,13 +18,15 @@ infrastructure/     Postgres queries, HTTP handlers, outside clients
 
 A layer starts as one file and becomes a folder once it outgrows it.
 
-`platform/` holds shared technical pieces (database pool, error responses)
+`platform/` holds shared technical pieces (database pool, error responses,
+tokens, passwords, and `permissions`, which every module checks access
+through)
 and `shared_kernel/` holds types every module uses, like `TenantId`.
 
 Modules so far:
 
 - `tenancy`: which tenant this deployment is, asked from the admin service
-- `employees`: employees, their permissions, and sign-in
+- `employees`: employees and sign-in
 
 `debt_core` and `dialer_integration` are laid out but still empty.
 
